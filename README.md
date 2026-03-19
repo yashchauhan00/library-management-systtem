@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Library Management System (Full-Stack)
 
 Flowchart ke hisaab se ye app:
@@ -100,3 +101,7 @@ Reports (JWT required):
 - Availability: `issue` pe `availableCopies` decrease hota hai, `return` pe increase hota hai.
 - Pending requests: `return` ke baad pehli pending request auto-approve ho sakti hai agar borrow limit aur copies available ho.
 
+=======
+# library-management-system
+A full-stack Library Management System built using MERN Stack (MongoDB, Express.js, React.js, Node.js).
+>>>>>>> 68d4e309b2c13721390cb3e5ef62bb665b15dacc
