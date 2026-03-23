@@ -1,54 +1,37 @@
-import express from "express";
-import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
-
-import User from "../models/User.js";
-import { requireAuth } from "../middleware/auth.js";
+const express = require("express");
+const jwt = require("jsonwebtoken");
+const User = require("../models/User");
 
 const router = express.Router();
 
 router.post("/login", async (req, res) => {
   try {
-    const { userId, password } = req.body ?? {};
-    if (!userId || !password) {
-      return res.status(400).json({ message: "userId and password are required" });
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ message: "Username and password are required" });
     }
 
-    const user = await User.findOne({ userId: String(userId).trim() });
-    if (!user) return res.status(401).json({ message: "Invalid credentials" });
-    if (user.status !== "active") return res.status(403).json({ message: "User is not active" });
+    const user = await User.findOne({ username });
+    if (!user || !user.isActive) {
+      return res.status(401).json({ message: "Invalid credentials" });
+    }
 
-    const ok = await bcrypt.compare(String(password), user.passwordHash);
+    const ok = await user.comparePassword(password);
     if (!ok) return res.status(401).json({ message: "Invalid credentials" });
 
     const token = jwt.sign(
-      { role: user.role },
+      { id: user._id, role: user.role, username: user.username, name: user.name },
       process.env.JWT_SECRET,
-      { subject: String(user._id), expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
+      { expiresIn: "1d" }
     );
 
-    return res.json({
+    res.json({
       token,
-      role: user.role,
-      user: { userId: user.userId, name: user.name, membershipId: user.membership ?? null },
+      user: { id: user._id, name: user.name, username: user.username, role: user.role }
     });
   } catch (err) {
-    return res.status(500).json({ message: "Login failed" });
+    res.status(500).json({ message: "Login failed" });
   }
 });
 
-router.get("/me", requireAuth, async (req, res) => {
-  const user = await User.findById(req.auth.userId).populate("membership");
-  if (!user) return res.status(404).json({ message: "User not found" });
-  return res.json({
-    user: {
-      userId: user.userId,
-      name: user.name,
-      role: user.role,
-      membership: user.membership,
-    },
-  });
-});
-
-export default router;
-
+module.exports = router;

@@ -1,10 +1,8 @@
-import mongoose from "mongoose";
+const mongoose = require("mongoose");
 
-export async function connectDb() {
-  const uri = process.env.MONGODB_URI;
-  if (!uri) throw new Error("Missing MONGODB_URI in environment");
-  mongoose.set("strictQuery", true);
-  await mongoose.connect(uri);
-  return mongoose.connection;
-}
+const connectDB = async () => {
+  await mongoose.connect(process.env.MONGO_URI);
+  console.log("MongoDB connected");
+};
 
+module.exports = connectDB;

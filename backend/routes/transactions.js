@@ -1,448 +1,153 @@
-import express from "express";
-
-import { requireAuth } from "../middleware/auth.js";
-import User from "../models/User.js";
-import Membership from "../models/Membership.js";
-import Item from "../models/Item.js";
-import Copy from "../models/Copy.js";
-import Transaction from "../models/Transaction.js";
-import IssueRequest from "../models/IssueRequest.js";
+const express = require("express");
+const mongoose = require("mongoose");
+const Book = require("../models/Book");
+const Membership = require("../models/Membership");
+const IssueTransaction = require("../models/IssueTransaction");
+const Fine = require("../models/Fine");
+const { requireAuth } = require("../middleware/auth");
 
 const router = express.Router();
-
-const MS_PER_DAY = 24 * 60 * 60 * 1000;
-
-function addDays(date, days) {
-  return new Date(date.getTime() + days * MS_PER_DAY);
-}
-
-function calcLateDays({ dueDate, returnDate }) {
-  if (!dueDate || !returnDate) return 0;
-  const diff = returnDate.getTime() - dueDate.getTime();
-  if (diff <= 0) return 0;
-  return Math.ceil(diff / MS_PER_DAY);
-}
-
 router.use(requireAuth);
 
-function toDateOnly(d) {
-  const x = new Date(d);
-  x.setHours(0, 0, 0, 0);
-  return x;
-}
+const toDateOnly = (value) => new Date(new Date(value).toISOString().split("T")[0]);
 
-function addDaysOnly(date, days) {
-  const d = toDateOnly(date);
-  d.setDate(d.getDate() + days);
-  return d;
-}
+const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-async function getUserMembership(user) {
-  const membership = user.membership;
-  if (membership) return membership;
-  return Membership.findOne({ membershipCode: "DEFAULT" }).catch(() => null);
-}
-
-router.post("/search-available-copies", async (req, res) => {
+router.get("/availability", async (req, res) => {
   try {
-    const { type, title, authorName, category } = req.body ?? {};
-    const typeNorm = type ? String(type).toLowerCase() : null;
-
-    const hasAnySearch = Boolean(title || authorName || category || typeNorm);
-    if (!hasAnySearch) {
-      return res.status(400).json({ message: "Fill at least one search field" });
+    const title = String(req.query.title || "").trim();
+    const author = String(req.query.author || "").trim();
+    const category = String(req.query.category || "").trim();
+    if (!title && !author && !category) {
+      return res.status(400).json({ message: "Select at least one search field" });
     }
-
-    const itemFilter = {};
-    if (typeNorm) itemFilter.itemType = typeNorm;
-    if (title) itemFilter.title = { $regex: String(title).trim(), $options: "i" };
-    if (authorName) itemFilter.authorName = { $regex: String(authorName).trim(), $options: "i" };
-    if (category) itemFilter.category = { $regex: String(category).trim(), $options: "i" };
-
-    const items = await Item.find(itemFilter).select({ _id: 1 });
-    if (!items.length) return res.json({ results: [] });
-
-    const copies = await Copy.find({ item: { $in: items.map((i) => i._id) }, status: "available" })
-      .populate("item")
-      .sort({ serialNo: 1 });
-
-    return res.json({
-      results: copies.map((c) => ({
-        serialNo: c.serialNo,
-        title: c.item.title,
-        authorName: c.item.authorName,
-        category: c.item.category,
-        itemType: c.item.itemType,
-        available: true,
-      })),
-    });
+    const q = {};
+    if (title) q.title = new RegExp(escapeRegex(title), "i");
+    if (author) q.author = new RegExp(escapeRegex(author), "i");
+    if (category) q.category = new RegExp(escapeRegex(category), "i");
+    const books = await Book.find(q);
+    res.json(books);
   } catch (err) {
-    return res.status(500).json({ message: "Search failed" });
-  }
-});
-
-router.post("/issue-by-serial", async (req, res) => {
-  try {
-    const { serialNo, issueDate, returnDate, remarks } = req.body ?? {};
-    if (!serialNo) return res.status(400).json({ message: "serialNo is required" });
-    if (!issueDate) return res.status(400).json({ message: "issueDate is required" });
-    if (!returnDate) return res.status(400).json({ message: "returnDate is required" });
-
-    const user = await User.findById(req.auth.userId).populate("membership");
-    if (!user) return res.status(404).json({ message: "User not found" });
-    if (user.status !== "active") return res.status(403).json({ message: "User is not active" });
-
-    const copy = await Copy.findOne({ serialNo: String(serialNo).trim() }).populate("item");
-    if (!copy) return res.status(404).json({ message: "Book copy not found" });
-    if (copy.status !== "available") return res.status(409).json({ message: "Book is not available" });
-
-    const membership = await getUserMembership(user);
-    const borrowMax = membership?.maxBorrowLimit ?? Number(process.env.DEFAULT_MAX_BORROW_LIMIT || 5);
-    const finePerDay = membership?.finePerDay ?? Number(process.env.DEFAULT_FINE_PER_DAY || 5);
-
-    const activeCount = await Transaction.countDocuments({
-      user: user._id,
-      status: "active",
-    });
-    if (activeCount >= borrowMax) {
-      return res.status(409).json({ message: "Borrow limit reached" });
-    }
-
-    const today = toDateOnly(new Date());
-    const issue = toDateOnly(issueDate);
-    const due = toDateOnly(returnDate);
-
-    if (issue < today) return res.status(400).json({ message: "Issue date cannot be less than today" });
-    if (due < issue) return res.status(400).json({ message: "Return date cannot be before issue date" });
-
-    const maxDue = addDaysOnly(issue, 15);
-    if (due > maxDue) {
-      return res.status(400).json({ message: "Return date cannot be more than 15 days ahead" });
-    }
-
-    const tx = await Transaction.create({
-      user: user._id,
-      item: copy.item._id,
-      copy: copy._id,
-      issueDate: issue,
-      dueDate: due,
-      status: "active",
-      fineAmount: 0,
-      finePaid: false,
-      remarks: remarks ? String(remarks) : "",
-    });
-
-    copy.status = "issued";
-    await copy.save();
-    await Item.updateOne({ _id: copy.item._id }, { $inc: { availableCopies: -1 } });
-
-    return res.json({
-      status: "issued",
-      transactionId: tx._id,
-      issueDate: tx.issueDate,
-      dueDate: tx.dueDate,
-      finePerDay,
-    });
-  } catch (err) {
-    return res.status(500).json({ message: "Issue failed" });
-  }
-});
-
-router.post("/return-init", async (req, res) => {
-  try {
-    const { serialNo, returnDate } = req.body ?? {};
-    if (!serialNo) return res.status(400).json({ message: "serialNo is required" });
-    if (!returnDate) return res.status(400).json({ message: "returnDate is required" });
-
-    const user = await User.findById(req.auth.userId).populate("membership");
-    if (!user) return res.status(404).json({ message: "User not found" });
-
-    const copy = await Copy.findOne({ serialNo: String(serialNo).trim() }).populate("item");
-    if (!copy) return res.status(404).json({ message: "Book copy not found" });
-
-    const tx = await Transaction.findOne({
-      user: user._id,
-      copy: copy._id,
-      status: "active",
-    }).populate("item user");
-
-    if (!tx) return res.status(404).json({ message: "Active issue not found for this serialNo" });
-
-    const membership = user.membership;
-    const finePerDay = membership?.finePerDay ?? Number(process.env.DEFAULT_FINE_PER_DAY || 5);
-
-    const due = toDateOnly(tx.dueDate);
-    const actualReturn = toDateOnly(returnDate);
-    const lateDays = calcLateDays({ dueDate: due, returnDate: actualReturn });
-    const fineAmount = Math.max(0, lateDays * finePerDay);
-
-    tx.returnDate = actualReturn;
-    tx.fineAmount = fineAmount;
-    tx.finePaid = false;
-    tx.status = "return_pending";
-    await tx.save();
-
-    return res.json({
-      status: "return_pending",
-      transactionId: tx._id,
-      issueDate: tx.issueDate,
-      dueDate: tx.dueDate,
-      returnDate: tx.returnDate,
-      fineAmount,
-      finePerDay,
-      remarks: tx.remarks || "",
-    });
-  } catch (err) {
-    return res.status(500).json({ message: "Return failed" });
-  }
-});
-
-router.post("/pay-fine", async (req, res) => {
-  try {
-    const { transactionId, finePaid, remarks } = req.body ?? {};
-    if (!transactionId) return res.status(400).json({ message: "transactionId is required" });
-
-    const tx = await Transaction.findOne({
-      _id: transactionId,
-      user: req.auth.userId,
-      status: "return_pending",
-    });
-    if (!tx) return res.status(404).json({ message: "Return pending transaction not found" });
-
-    const shouldRequirePaid = (tx.fineAmount ?? 0) > 0;
-    const paidBool = Boolean(finePaid);
-
-    if (shouldRequirePaid && !paidBool) {
-      return res.status(400).json({ message: "Please confirm paid fine to complete return" });
-    }
-
-    const now = new Date();
-    tx.status = "returned";
-    tx.finePaid = shouldRequirePaid ? paidBool : true;
-    tx.paidAt = now;
-    tx.remarks = remarks ? String(remarks) : "";
-    await tx.save();
-
-    // Release the copy
-    const copy = await Copy.findById(tx.copy).populate("item");
-    if (copy) {
-      copy.status = "available";
-      await copy.save();
-      await Item.updateOne({ _id: copy.item._id }, { $inc: { availableCopies: 1 } });
-    }
-
-    return res.json({ status: "returned", fineAmount: tx.fineAmount });
-  } catch (err) {
-    return res.status(500).json({ message: "Pay fine failed" });
-  }
-});
-
-router.post("/check-availability", async (req, res) => {
-  try {
-    const { itemCode } = req.body ?? {};
-    if (!itemCode) return res.status(400).json({ message: "itemCode is required" });
-
-    const item = await Item.findOne({ itemCode: String(itemCode).trim() });
-    if (!item) return res.status(404).json({ message: "Item not found" });
-
-    return res.json({
-      itemCode: item.itemCode,
-      itemType: item.itemType,
-      title: item.title,
-      availableCopies: item.availableCopies,
-    });
-  } catch (err) {
-    return res.status(500).json({ message: "Check availability failed" });
+    console.error("availability search", err);
+    res.status(500).json({ message: err.message || "Search failed" });
   }
 });
 
 router.post("/issue", async (req, res) => {
   try {
-    const { itemCode } = req.body ?? {};
-    if (!itemCode) return res.status(400).json({ message: "itemCode is required" });
+  const { bookId, membershipNumber, issueDate, returnDate, remarks = "" } = req.body;
+  if (!bookId || !issueDate) {
+    return res.status(400).json({ message: "Book, and issue date required" });
+  }
 
-    const user = await User.findById(req.auth.userId).populate("membership");
-    if (!user) return res.status(404).json({ message: "User not found" });
-    if (user.status !== "active") return res.status(403).json({ message: "User is not active" });
-
-    const item = await Item.findOne({ itemCode: String(itemCode).trim() });
-    if (!item) return res.status(404).json({ message: "Item not found" });
-
-    const membership =
-      user.membership ||
-      (await Membership.findOne({ membershipCode: "DEFAULT" }).catch(() => null));
-
-    const borrowDurationDays = membership?.borrowDurationDays
-      ?? Number(process.env.DEFAULT_BORROW_DURATION_DAYS || 7);
-    const finePerDay = membership?.finePerDay ?? Number(process.env.DEFAULT_FINE_PER_DAY || 5);
-    const maxBorrowLimit =
-      membership?.maxBorrowLimit ?? Number(process.env.DEFAULT_MAX_BORROW_LIMIT || 5);
-
-    const activeCount = await Transaction.countDocuments({
-      user: user._id,
-      status: "active",
+  if (!mongoose.Types.ObjectId.isValid(bookId)) {
+    return res.status(400).json({
+      message: "Pehle search karke table me se book select karo (last column radio)"
     });
-    if (activeCount >= maxBorrowLimit) {
-      return res.status(409).json({ message: "Borrow limit reached" });
-    }
+  }
 
-    const now = new Date();
-
-    // If copies available -> issue directly, else create pending request.
-    if (item.availableCopies > 0) {
-      const copy = await Copy.findOne({ item: item._id, status: "available" });
-      if (!copy) {
-        return res.status(409).json({ message: "No available copy found" });
-      }
-
-      const transaction = await Transaction.create({
-        user: user._id,
-        item: item._id,
-        copy: copy._id,
-        issueDate: now,
-        dueDate: addDays(now, borrowDurationDays),
-        status: "active",
-      });
-
-      copy.status = "issued";
-      await copy.save();
-      await Item.updateOne({ _id: item._id }, { $inc: { availableCopies: -1 } });
-
-      return res.json({
-        status: "issued",
-        transactionId: transaction._id,
-        dueDate: transaction.dueDate,
-        finePerDay,
-      });
-    }
-
-    const request = await IssueRequest.create({
-      user: user._id,
-      item: item._id,
-      status: "pending",
-      requestedAt: now,
+  const book = await Book.findById(bookId);
+  if (!book) {
+    return res.status(400).json({
+      message: "Book database me nahi mila — dubara search karke select karo"
     });
+  }
+  if (!book.availability) return res.status(400).json({ message: "Book not available" });
 
-    return res.json({
-      status: "pending",
-      requestId: request._id,
+  const memberNo = String(membershipNumber).trim();
+  if (!memberNo) {
+    return res.status(400).json({ message: "Membership number is required" });
+  }
+  const member = await Membership.findOne({ membershipNumber: memberNo });
+  if (!member) {
+    return res.status(400).json({
+      message: `Member nahi mila: "${memberNo}". Maintenance se sahi Membership Number likho (jaise M123...)`
     });
+  }
+
+  const today = toDateOnly(new Date());
+  const issue = toDateOnly(issueDate);
+  if (issue < today) return res.status(400).json({ message: "Issue date cannot be less than today" });
+
+  const maxReturn = new Date(issue);
+  maxReturn.setDate(maxReturn.getDate() + 15);
+  const selectedReturn = returnDate ? toDateOnly(returnDate) : maxReturn;
+  if (selectedReturn > maxReturn) {
+    return res.status(400).json({ message: "Return date cannot exceed 15 days" });
+  }
+
+  const tx = await IssueTransaction.create({
+    book: book._id,
+    member: member._id,
+    issueDate: issue,
+    returnDate: selectedReturn,
+    remarks,
+    status: "issued"
+  });
+  book.availability = false;
+  await book.save();
+  res.json(await tx.populate(["book" ,"member"]));
   } catch (err) {
-    return res.status(500).json({ message: "Issue failed" });
+    console.error(err);
+    return res.status(400).json({ message: err.message || "Issue book failed" });
   }
 });
 
 router.post("/return", async (req, res) => {
-  try {
-    const { itemCode } = req.body ?? {};
-    if (!itemCode) return res.status(400).json({ message: "itemCode is required" });
-
-    const user = await User.findById(req.auth.userId).populate("membership");
-    if (!user) return res.status(404).json({ message: "User not found" });
-
-    const item = await Item.findOne({ itemCode: String(itemCode).trim() });
-    if (!item) return res.status(404).json({ message: "Item not found" });
-
-    const activeTx = await Transaction.findOne({
-      user: user._id,
-      item: item._id,
-      status: "active",
-    });
-
-    if (!activeTx) return res.status(404).json({ message: "No active issue found for this item" });
-
-    const now = new Date();
-    const membership = user.membership;
-    const finePerDay = membership?.finePerDay ?? Number(process.env.DEFAULT_FINE_PER_DAY || 5);
-
-    const lateDays = calcLateDays({ dueDate: activeTx.dueDate, returnDate: now });
-    const fineAmount = Math.max(0, lateDays * finePerDay);
-
-    activeTx.returnDate = now;
-    activeTx.status = "returned";
-    activeTx.fineAmount = fineAmount;
-    activeTx.finePaid = true;
-    activeTx.paidAt = now;
-    await activeTx.save();
-
-    // Return increases availability
-    if (activeTx.copy) {
-      const copy = await Copy.findById(activeTx.copy);
-      if (copy) {
-        copy.status = "available";
-        await copy.save();
-      }
-    }
-    await Item.updateOne({ _id: item._id }, { $inc: { availableCopies: 1 } });
-
-    // Auto-approve first pending request if possible
-    const pending = await IssueRequest.find({ item: item._id, status: "pending" })
-      .sort({ requestedAt: 1 })
-      .limit(5)
-      .populate("user");
-
-    let approved = null;
-
-    for (const reqItem of pending) {
-      const pendingUser = reqItem.user;
-      // populate membership for limits (best-effort)
-      if (!pendingUser.membership) continue;
-      const pendingMembership = await Membership.findById(pendingUser.membership).catch(() => null);
-      const pendingMaxBorrowLimit =
-        pendingMembership?.maxBorrowLimit ?? Number(process.env.DEFAULT_MAX_BORROW_LIMIT || 5);
-      const activeCount = await Transaction.countDocuments({
-        user: pendingUser._id,
-        status: "active",
-      });
-      if (activeCount >= pendingMaxBorrowLimit) continue;
-
-      // Ensure a copy is available
-      const freshItem = await Item.findById(item._id);
-      if (!freshItem || freshItem.availableCopies <= 0) break;
-
-      const approvedCopy = await Copy.findOne({ item: item._id, status: "available" });
-      if (!approvedCopy) break;
-
-      const pendingBorrowDurationDays =
-        pendingMembership?.borrowDurationDays ??
-        Number(process.env.DEFAULT_BORROW_DURATION_DAYS || 7);
-
-      const approvedTx = await Transaction.create({
-        user: pendingUser._id,
-        item: item._id,
-        copy: approvedCopy._id,
-        issueDate: now,
-        dueDate: addDays(now, pendingBorrowDurationDays),
-        status: "active",
-      });
-
-      approvedCopy.status = "issued";
-      await approvedCopy.save();
-      await Item.updateOne({ _id: item._id }, { $inc: { availableCopies: -1 } });
-
-      reqItem.status = "approved";
-      reqItem.approvedTransaction = approvedTx._id;
-      await reqItem.save();
-
-      approved = {
-        requestId: reqItem._id,
-        approvedTransactionId: approvedTx._id,
-        userId: pendingUser.userId,
-        dueDate: approvedTx.dueDate,
-      };
-      break;
-    }
-
-    return res.json({
-      status: "returned",
-      fineAmount,
-      lateDays,
-      approved,
-    });
-  } catch (err) {
-    return res.status(500).json({ message: "Return failed" });
+  const { transactionId, serialNumber, returnDate, remarks = "" } = req.body;
+  if (!transactionId || !serialNumber) {
+    return res.status(400).json({ message: "Serial number and transaction required" });
   }
+  const tx = await IssueTransaction.findById(transactionId).populate("book");
+  if (!tx) return res.status(404).json({ message: "Transaction not found" });
+  if (tx.status !== "issued") {
+    return res.status(400).json({ message: "This book is not an active issue" });
+  }
+  if (tx.book.serialNumber !== serialNumber) {
+    return res.status(400).json({ message: "Serial number mismatch" });
+  }
+
+  const note = String(remarks || "").trim();
+  if (note) {
+    tx.remarks = tx.remarks ? `${tx.remarks}\n${note}` : note;
+  }
+
+  tx.actualReturnDate = returnDate ? toDateOnly(returnDate) : toDateOnly(new Date());
+  tx.status = "returned";
+  await tx.save();
+
+  tx.book.availability = true;
+  await tx.book.save();
+
+  const due = toDateOnly(tx.returnDate);
+  const actual = toDateOnly(tx.actualReturnDate);
+  const delayDays = Math.max(0, Math.ceil((actual - due) / (1000 * 60 * 60 * 24)));
+  const amount = delayDays * 10;
+  const fine = await Fine.create({ issueTransaction: tx._id, amount });
+
+  res.json({ transaction: tx, fine, nextPage: "pay-fine" });
 });
 
-export default router;
+router.post("/pay-fine", async (req, res) => {
+  const { transactionId, finePaid = false, remarks = "" } = req.body;
+  const tx = await IssueTransaction.findById(transactionId);
+  if (!tx) return res.status(404).json({ message: "Transaction not found" });
+  const fine = await Fine.findOne({ issueTransaction: tx._id });
+  if (!fine) return res.status(404).json({ message: "Fine details missing" });
 
+  if (fine.amount > 0 && !finePaid) {
+    return res.status(400).json({ message: "Fine must be paid before completion" });
+  }
+
+  fine.finePaid = Boolean(finePaid);
+  fine.remarks = remarks;
+  await fine.save();
+  res.json({ message: "Return completed", fine });
+});
+
+router.get("/issues", async (req, res) => {
+  const data = await IssueTransaction.find().populate(["book", "member"]).sort({ createdAt: -1 });
+  res.json(data);
+});
+
+module.exports = router;

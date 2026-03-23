@@ -1,36 +1,26 @@
-import jwt from "jsonwebtoken";
+const jwt = require("jsonwebtoken");
 
-function getTokenFromHeader(req) {
-  const header = req.headers.authorization;
-  if (!header) return null;
-  const [scheme, token] = header.split(" ");
-  if (scheme !== "Bearer" || !token) return null;
-  return token;
-}
+const requireAuth = (req, res, next) => {
+  const token = req.headers.authorization?.startsWith("Bearer ")
+    ? req.headers.authorization.split(" ")[1]
+    : null;
 
-export function requireAuth(req, res, next) {
+  if (!token) return res.status(401).json({ message: "Unauthorized" });
+
   try {
-    const token = getTokenFromHeader(req);
-    if (!token) return res.status(401).json({ message: "Missing token" });
     const payload = jwt.verify(token, process.env.JWT_SECRET);
-    req.auth = {
-      userId: payload.sub,
-      role: payload.role,
-    };
-    return next();
+    req.user = payload;
+    next();
   } catch (err) {
-    return res.status(401).json({ message: "Invalid/expired token" });
+    return res.status(401).json({ message: "Invalid token" });
   }
-}
+};
 
-export function requireRole(roles) {
-  const allowed = Array.isArray(roles) ? roles : [roles];
-  return (req, res, next) => {
-    if (!req.auth?.role) return res.status(403).json({ message: "Forbidden" });
-    if (!allowed.includes(req.auth.role)) {
-      return res.status(403).json({ message: "Forbidden" });
-    }
-    return next();
-  };
-}
+const requireRole = (...roles) => (req, res, next) => {
+  if (!req.user || !roles.includes(req.user.role)) {
+    return res.status(403).json({ message: "Forbidden" });
+  }
+  next();
+};
 
+module.exports = { requireAuth, requireRole };
