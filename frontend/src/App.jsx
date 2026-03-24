@@ -1,11 +1,11 @@
 import React from "react";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
-import LoginPage from "./pages/Loginpage/LoginPage";
-import AdminDashboard from "./pages/AdminDashboard/AdminDashboard";
-import UserDashboard from "./pages/UserDashboard/UserDashboard";
-import MaintenancePage from "./pages/MaintenacePage/MaintenancePage";
-import TransactionsPage from "./pages/TransactionPage/TransactionsPage";
-import ReportsPage from "./pages/ReportsPage/ReportsPage";
+import { Navigate, Routes, Route } from "react-router-dom";
+import LoginPage from "./Pages/Loginpage/LoginPage";
+import AdminDashboard from "./Pages/AdminDashboard/AdminDashboard";
+import UserDashboard from "./Pages/UserDashboard/UserDashboard";
+import MaintenancePage from "./Pages/MaintenacePage/MaintenancePage";
+import TransactionsPage from "./Pages/TransactionPage/TransactionsPage";
+import ReportsPage from "./Pages/ReportsPage/ReportsPage";
 
 const Guard = ({ children, role }) => {
   const user = JSON.parse(localStorage.getItem("user") || "null");
